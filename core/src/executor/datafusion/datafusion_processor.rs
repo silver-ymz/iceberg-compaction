@@ -54,6 +54,7 @@ const SYS_HIDDEN_COLS: [&str; 3] = [SYS_HIDDEN_SEQ_NUM, SYS_HIDDEN_FILE_PATH, SY
 pub struct DatafusionProcessor {
     table_register: DatafusionTableRegister,
     ctx: Arc<SessionContext>,
+    memory_pool: Option<Arc<dyn MemoryPool>>,
 }
 
 impl DatafusionProcessor {
@@ -76,18 +77,21 @@ impl DatafusionProcessor {
         // they exceed the budget, instead of buffering all decoded Arrow data
         // in memory and OOM-killing the process. With no budget we keep the
         // previous behavior: an unbounded pool and no spilling.
-        let ctx = match execution_config.max_memory_bytes {
+        let (ctx, memory_pool) = match execution_config.max_memory_bytes {
             Some(max_memory_bytes) if max_memory_bytes > 0 => {
-                let runtime_env = build_spilling_runtime_env(
+                let (runtime_env, pool) = build_spilling_runtime_env(
                     max_memory_bytes,
                     execution_config.spill_dir.as_deref(),
                 )?;
-                Arc::new(SessionContext::new_with_config_rt(
-                    session_config,
-                    runtime_env,
-                ))
+                (
+                    Arc::new(SessionContext::new_with_config_rt(
+                        session_config,
+                        runtime_env,
+                    )),
+                    Some(pool),
+                )
             }
-            _ => Arc::new(SessionContext::new_with_config(session_config)),
+            _ => (Arc::new(SessionContext::new_with_config(session_config)), None),
         };
 
         let table_register = DatafusionTableRegister::new(
@@ -101,6 +105,7 @@ impl DatafusionProcessor {
         Ok(Self {
             table_register,
             ctx,
+            memory_pool,
         })
     }
 
@@ -151,6 +156,13 @@ impl DatafusionProcessor {
             }
         }
         Ok(())
+    }
+
+    /// Returns the memory pool used by the DataFusion runtime, if a bounded
+    /// memory budget was configured. `None` when no budget is set (unbounded
+    /// pool), in which case peak memory cannot be tracked.
+    pub fn memory_pool(&self) -> Option<&Arc<dyn MemoryPool>> {
+        self.memory_pool.as_ref()
     }
 
     /// Executes the compaction query using `DataFusion`
@@ -226,17 +238,17 @@ impl DatafusionProcessor {
 fn build_spilling_runtime_env(
     max_memory_bytes: usize,
     spill_dir: Option<&std::path::Path>,
-) -> Result<Arc<RuntimeEnv>> {
+) -> Result<(Arc<RuntimeEnv>, Arc<dyn MemoryPool>)> {
     let memory_pool = Arc::new(FairSpillPool::new(max_memory_bytes)) as Arc<dyn MemoryPool>;
     let disk_manager_mode = match spill_dir {
         Some(dir) => DiskManagerMode::Directories(vec![dir.to_path_buf()]),
         None => DiskManagerMode::OsTmpDirectory,
     };
     let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(memory_pool)
+        .with_memory_pool(Arc::clone(&memory_pool))
         .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(disk_manager_mode))
         .build_arc()?;
-    Ok(runtime_env)
+    Ok((runtime_env, memory_pool))
 }
 
 fn build_physical_sort_exprs(
@@ -1008,7 +1020,7 @@ mod tests {
         use datafusion::physical_plan::collect;
 
         // 4 MiB budget vs a ~16 MiB sort input -> SortExec must spill.
-        let runtime_env = build_spilling_runtime_env(4 * 1024 * 1024, None).unwrap();
+        let (runtime_env, _pool) = build_spilling_runtime_env(4 * 1024 * 1024, None).unwrap();
         // target_partitions=1 keeps the plan root a single SortExec so its
         // spill_count metric is directly observable. The merge-phase reservation
         // is lowered so it fits inside the small pool (the default reservation

@@ -222,6 +222,9 @@ pub struct RewriteResult {
     pub plan: CompactionPlan,
     /// Validation info for creating `CompactionValidator` later
     pub validation_info: Option<ValidationInfo>,
+    /// DataFusion memory pool 的实际峰值内存占用（字节）。
+    /// None 表示未配置 memory budget（unbounded pool），无法追踪。
+    pub peak_datafusion_memory_bytes: Option<usize>,
 }
 
 /// Information for deferred `CompactionValidator` creation.
@@ -240,6 +243,9 @@ pub struct CompactionResult {
     pub stats: RewriteFilesStat,
     /// Updated table metadata after commit (if available)
     pub table: Option<Table>,
+    /// DataFusion memory pool 的实际峰值内存占用（字节）。
+    /// None 表示未配置 memory budget（unbounded pool），无法追踪。
+    pub peak_datafusion_memory_bytes: Option<usize>,
 }
 
 impl Compaction {
@@ -397,6 +403,7 @@ impl Compaction {
             let RewriteFilesResponse {
                 data_files: output_data_files,
                 stats,
+                peak_datafusion_memory_bytes,
             } = match self.executor.rewrite_files(rewrite_files_request).await {
                 Ok(response) => response,
                 Err(e) => {
@@ -427,6 +434,7 @@ impl Compaction {
                 stats,
                 plan,
                 validation_info,
+                peak_datafusion_memory_bytes,
             })
         } else {
             Err(CompactionError::Execution(format!(
@@ -578,6 +586,12 @@ impl Compaction {
         // Reuse the existing stats merger to avoid duplication
         let merged_stats = self.merge_rewrite_stats(&results);
 
+        // Track the maximum peak memory across all rewrite results.
+        let peak_datafusion_memory_bytes = results
+            .iter()
+            .filter_map(|r| r.peak_datafusion_memory_bytes)
+            .max();
+
         // Collect all output data files
         let mut merged_data_files = Vec::new();
         for result in results {
@@ -588,6 +602,7 @@ impl Compaction {
             data_files: merged_data_files,
             stats: merged_stats,
             table,
+            peak_datafusion_memory_bytes,
         }
     }
 
@@ -699,6 +714,7 @@ impl Compaction {
             data_files: rewrite_result.output_data_files,
             stats: rewrite_result.stats,
             table: Some(final_table),
+            peak_datafusion_memory_bytes: rewrite_result.peak_datafusion_memory_bytes,
         };
 
         Ok(Some(result))
@@ -2317,12 +2333,14 @@ mod tests {
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
+            peak_datafusion_memory_bytes: None,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
+            peak_datafusion_memory_bytes: None,
         };
         let err = compaction
             .commit_rewrite_results(vec![r1, r2])
@@ -2342,12 +2360,14 @@ mod tests {
             stats: RewriteFilesStat::default(),
             plan: plan1,
             validation_info: None,
+            peak_datafusion_memory_bytes: None,
         };
         let r2 = RewriteResult {
             output_data_files: vec![],
             stats: RewriteFilesStat::default(),
             plan: plan2,
             validation_info: None,
+            peak_datafusion_memory_bytes: None,
         };
         let err = compaction
             .commit_rewrite_results(vec![r1, r2])

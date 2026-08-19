@@ -15,6 +15,7 @@
 */
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -74,13 +75,18 @@ impl CompactionExecutor for DataFusionExecutor {
             .with_input_data_files(file_group)
             .with_sort_order(sort_order.clone())
             .build()?;
-        let (batches, input_schema) = DatafusionProcessor::new(
+        let processor = DatafusionProcessor::new(
             execution_config.clone(),
             executor_parallelism,
             file_io.clone(),
-        )?
-        .execute(datafusion_task_ctx, output_parallelism)
-        .await?;
+        )?;
+        // If a bounded memory pool was configured, sample `pool.reserved()` after
+        // each batch to track the high-water mark across all partitions.
+        let memory_pool = processor.memory_pool().map(Arc::clone);
+        let peak_bytes = Arc::new(AtomicUsize::new(0));
+        let (batches, input_schema) = processor
+            .execute(datafusion_task_ctx, output_parallelism)
+            .await?;
         let arc_input_schema = Arc::new(input_schema);
         let mut futures = Vec::with_capacity(executor_parallelism);
 
@@ -92,6 +98,8 @@ impl CompactionExecutor for DataFusionExecutor {
             let file_io = file_io.clone();
             let partition_spec = partition_spec.clone();
             let metrics_recorder = metrics_recorder.clone();
+            let memory_pool = memory_pool.clone();
+            let peak_bytes = peak_bytes.clone();
 
             let future: JoinHandle<
                 std::result::Result<Vec<iceberg::spec::DataFile>, CompactionError>,
@@ -116,6 +124,15 @@ impl CompactionExecutor for DataFusionExecutor {
                     }
 
                     let batch = batch_result?;
+
+                    // Sample current memory pool reservation after the batch is
+                    // materialized, tracking the high-water mark. `reserved()`
+                    // returns the currently allocated bytes (not historical peak),
+                    // so we must sample during consumption before reservations are
+                    // released at stream end.
+                    if let Some(pool) = &memory_pool {
+                        peak_bytes.fetch_max(pool.reserved(), Ordering::Relaxed);
+                    }
 
                     let record_count = batch.num_rows() as u64;
                     let batch_bytes = batch.get_array_memory_size() as u64;
@@ -153,9 +170,16 @@ impl CompactionExecutor for DataFusionExecutor {
 
         stats.record_output(&output_data_files);
 
+        // Read the peak memory high-water mark. None when no bounded pool was
+        // configured (unbounded pool — cannot track).
+        let peak_datafusion_memory_bytes = memory_pool.is_some().then(|| {
+            peak_bytes.load(Ordering::Relaxed)
+        });
+
         Ok(RewriteFilesResponse {
             data_files: output_data_files,
             stats,
+            peak_datafusion_memory_bytes,
         })
     }
 }

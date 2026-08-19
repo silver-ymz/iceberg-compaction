@@ -59,6 +59,9 @@ pub struct RewriteFilesRequest {
 pub struct RewriteFilesResponse {
     pub data_files: Vec<DataFile>,
     pub stats: RewriteFilesStat,
+    /// DataFusion memory pool 的实际峰值内存占用（字节）。
+    /// None 表示未配置 memory budget（unbounded pool），无法追踪。
+    pub peak_datafusion_memory_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
